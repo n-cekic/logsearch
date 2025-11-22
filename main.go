@@ -30,6 +30,7 @@ func main() {
 
 	// Define the transition to dashboard
 	showDashboard := func(host, port, user, pass, key, logPath string) {
+		log.Printf("Attempting connection to %s:%s with user '%s'", host, port, user)
 		client = ssh.NewClient()
 		err := client.Connect(host, port, user, pass, key)
 		if err != nil {
@@ -37,13 +38,15 @@ func main() {
 			dialog.ShowError(err, w)
 			return
 		}
-		log.Printf("Connected to %s:%s as %s", host, port, user)
+		log.Printf("Connected successfully to %s:%s", host, port)
 
+		log.Printf("Initializing dashboard with path: %s", logPath)
 		dashboard := ui.NewDashboard(w, client, logPath)
 		w.SetContent(dashboard.Container)
 	}
 
 	// Initial screen is Login
+	log.Println("Showing login screen")
 	loginScreen := ui.NewLoginScreen(showDashboard)
 	w.SetContent(loginScreen.Container)
 

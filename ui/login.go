@@ -32,7 +32,7 @@ func NewLoginScreen(onConnect func(host, port, user, pass, key, logPath string))
 
 	logPathEntry := widget.NewEntry()
 	logPathEntry.SetPlaceHolder("Remote Log Path (e.g., /var/log/logstash)")
-	logPathEntry.Text = "/var/log/logstash"
+	logPathEntry.Text = "/home/ncekic/src/logsearch/testing_logs"
 
 	// Custom layout to center the button
 	connectBtn := widget.NewButtonWithIcon("Connect", theme.LoginIcon(), func() {

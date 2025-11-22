@@ -156,3 +156,43 @@ func (c *Client) ReadFile(path string) ([]byte, error) {
 
 	return output, nil
 }
+
+// Search executes a grep command on the remote server.
+// It supports multiple paths and regex patterns.
+// It uses `zgrep` to handle both plain and compressed files.
+func (c *Client) Search(paths []string, pattern string) (string, error) {
+	session, err := c.client.NewSession()
+	if err != nil {
+		return "", err
+	}
+	defer session.Close()
+
+	// Construct the command.
+	// We use `find` to get files and then pipe to `xargs zgrep`.
+	// This is robust for many files.
+	// Example: find path1 path2 -type f \( -name "*.log" -o -name "*.gz" \) -print0 | xargs -0 zgrep -H "pattern"
+
+	// Escape the pattern for shell safety (basic)
+	safePattern := strings.ReplaceAll(pattern, "\"", "\\\"")
+
+	var pathArgs []string
+	for _, p := range paths {
+		pathArgs = append(pathArgs, fmt.Sprintf("'%s'", p))
+	}
+
+	cmd := fmt.Sprintf("find %s -type f \\( -name \"*.log\" -o -name \"*.gz\" \\) -print0 | xargs -0 zgrep -H \"%s\"", strings.Join(pathArgs, " "), safePattern)
+
+	// If paths point directly to files, find might not be needed, but find works on files too.
+	// However, if the user selects a mix, find is safest.
+
+	output, err := session.Output(cmd)
+	if err != nil {
+		// grep returns exit code 1 if no matches found, which is not an error for us.
+		if exitErr, ok := err.(*ssh.ExitError); ok && exitErr.ExitStatus() == 1 {
+			return "", nil
+		}
+		return "", fmt.Errorf("search failed: %v", err)
+	}
+
+	return string(output), nil
+}

@@ -65,7 +65,7 @@ func NewLoginScreen(onConnect func(host, port, user, pass, key, logPath string))
 
 	// Wrap in a container that provides some minimum width
 	// We use a GridWrapLayout to force a minimum size for the card
-	sizedContent := container.NewGridWrap(fyne.NewSize(400, 400), card)
+	sizedContent := container.NewGridWrap(fyne.NewSize(600, 500), card)
 
 	content := container.NewCenter(
 		container.NewVBox(

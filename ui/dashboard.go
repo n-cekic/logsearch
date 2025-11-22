@@ -2,13 +2,13 @@ package ui
 
 import (
 	"fmt"
+	"log"
 	"logsearch/ssh"
 	"path/filepath"
-	"sort"
+	"strings"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
-	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 )
@@ -19,10 +19,12 @@ type Dashboard struct {
 	currentPath string
 	window      fyne.Window
 
-	fileList    *widget.List
-	fileEntries []ssh.FileEntry
+	fileTree    *widget.Tree
 	contentArea *widget.Entry
 	pathLabel   *widget.Label
+
+	// Cache for directory contents
+	dirCache map[string][]ssh.FileEntry
 }
 
 func NewDashboard(window fyne.Window, client *ssh.Client, initialPath string) *Dashboard {
@@ -30,42 +32,45 @@ func NewDashboard(window fyne.Window, client *ssh.Client, initialPath string) *D
 		sshClient:   client,
 		currentPath: initialPath,
 		window:      window,
+		dirCache:    make(map[string][]ssh.FileEntry),
 	}
 
 	d.pathLabel = widget.NewLabel(initialPath)
 	d.pathLabel.TextStyle = fyne.TextStyle{Monospace: true}
 
-	d.fileList = widget.NewList(
-		func() int {
-			return len(d.fileEntries)
+	// Create tree widget
+	d.fileTree = widget.NewTree(
+		// ChildUIDs: Return child node IDs for a given parent
+		func(uid widget.TreeNodeID) []widget.TreeNodeID {
+			return d.getChildUIDs(uid)
 		},
-		func() fyne.CanvasObject {
-			return container.NewHBox(widget.NewIcon(theme.FileIcon()), widget.NewLabel("Template"))
+		// IsBranch: Determine if a node is a directory
+		func(uid widget.TreeNodeID) bool {
+			return d.isBranch(uid)
 		},
-		func(id widget.ListItemID, item fyne.CanvasObject) {
-			entry := d.fileEntries[id]
-			box := item.(*fyne.Container)
-			icon := box.Objects[0].(*widget.Icon)
-			label := box.Objects[1].(*widget.Label)
-
-			label.SetText(entry.Name)
-			if entry.IsDir {
-				icon.SetResource(theme.FolderIcon())
-			} else {
-				icon.SetResource(theme.FileIcon())
-			}
+		// CreateNode: Create the visual template for a node
+		func(branch bool) fyne.CanvasObject {
+			return container.NewHBox(
+				widget.NewIcon(theme.FileIcon()),
+				widget.NewLabel("Template"),
+			)
+		},
+		// UpdateNode: Update the node with actual data
+		func(uid widget.TreeNodeID, branch bool, obj fyne.CanvasObject) {
+			d.updateNode(uid, branch, obj)
 		},
 	)
 
-	d.fileList.OnSelected = func(id widget.ListItemID) {
-		entry := d.fileEntries[id]
-		fullPath := filepath.Join(d.currentPath, entry.Name)
-
-		if entry.IsDir {
-			d.refreshFileList(fullPath)
-			d.fileList.UnselectAll()
+	// Handle node selection
+	d.fileTree.OnSelected = func(uid widget.TreeNodeID) {
+		path := string(uid)
+		if d.isBranch(uid) {
+			// Directory selected - update path label
+			d.pathLabel.SetText(path)
 		} else {
-			d.loadFileContent(fullPath)
+			// File selected - load content
+			d.loadFileContent(path)
+			d.pathLabel.SetText(path)
 		}
 	}
 
@@ -73,20 +78,10 @@ func NewDashboard(window fyne.Window, client *ssh.Client, initialPath string) *D
 	d.contentArea.TextStyle = fyne.TextStyle{Monospace: true}
 	d.contentArea.Wrapping = fyne.TextWrapOff // Better for logs
 
-	// Back button
-	backBtn := widget.NewButtonWithIcon("Up", theme.NavigateBackIcon(), func() {
-		parent := filepath.Dir(d.currentPath)
-		if parent != "." && parent != "/" {
-			d.refreshFileList(parent)
-		} else if parent == "/" {
-			d.refreshFileList("/")
-		}
-	})
-
 	leftPane := container.NewBorder(
-		container.NewVBox(widget.NewLabel("Files"), backBtn),
+		widget.NewLabel("Files"),
 		nil, nil, nil,
-		d.fileList,
+		d.fileTree,
 	)
 
 	rightPane := container.NewBorder(
@@ -104,36 +99,99 @@ func NewDashboard(window fyne.Window, client *ssh.Client, initialPath string) *D
 		split,
 	)
 
-	// Initial load
-	d.refreshFileList(initialPath)
+	// Initial load - open the root path
+	d.fileTree.OpenBranch(widget.TreeNodeID(initialPath))
 
 	return d
 }
 
-func (d *Dashboard) refreshFileList(path string) {
-	entries, err := d.sshClient.ListDir(path)
-	if err != nil {
-		dialog.ShowError(err, d.window)
-		return
+// getChildUIDs returns the child node IDs for a given parent
+func (d *Dashboard) getChildUIDs(uid widget.TreeNodeID) []widget.TreeNodeID {
+	var path string
+	if uid == "" {
+		// Root level - return the initial path
+		path = d.currentPath
+		return []widget.TreeNodeID{widget.TreeNodeID(path)}
 	}
 
-	// Sort: Directories first, then files
-	sort.Slice(entries, func(i, j int) bool {
-		if entries[i].IsDir && !entries[j].IsDir {
-			return true
-		}
-		if !entries[i].IsDir && entries[j].IsDir {
-			return false
-		}
-		return entries[i].Name < entries[j].Name
-	})
+	path = string(uid)
 
-	d.fileEntries = entries
-	d.currentPath = path
-	d.pathLabel.SetText(path)
-	d.fileList.Refresh()
+	// Check cache first
+	if entries, ok := d.dirCache[path]; ok {
+		return d.entriesToUIDs(path, entries)
+	}
+
+	// Load directory contents
+	entries, err := d.sshClient.ListDir(path)
+	if err != nil {
+		log.Printf("Failed to list directory %s: %v", path, err)
+		return []widget.TreeNodeID{}
+	}
+
+	// Cache the results
+	d.dirCache[path] = entries
+
+	return d.entriesToUIDs(path, entries)
 }
 
+// entriesToUIDs converts file entries to tree node IDs
+func (d *Dashboard) entriesToUIDs(parentPath string, entries []ssh.FileEntry) []widget.TreeNodeID {
+	var uids []widget.TreeNodeID
+	for _, entry := range entries {
+		fullPath := filepath.Join(parentPath, entry.Name)
+		uids = append(uids, widget.TreeNodeID(fullPath))
+	}
+	return uids
+}
+
+// isBranch determines if a node is a directory
+func (d *Dashboard) isBranch(uid widget.TreeNodeID) bool {
+	if uid == "" {
+		return true // Root is always a branch
+	}
+
+	path := string(uid)
+
+	// Check if this path is in our cache
+	parentPath := filepath.Dir(path)
+	if entries, ok := d.dirCache[parentPath]; ok {
+		name := filepath.Base(path)
+		for _, entry := range entries {
+			if entry.Name == name {
+				return entry.IsDir
+			}
+		}
+	}
+
+	// If not in cache, try to list it to see if it's a directory
+	// This is a fallback and shouldn't happen often
+	_, err := d.sshClient.ListDir(path)
+	return err == nil
+}
+
+// updateNode updates the visual representation of a node
+func (d *Dashboard) updateNode(uid widget.TreeNodeID, branch bool, obj fyne.CanvasObject) {
+	path := string(uid)
+	name := filepath.Base(path)
+
+	// Handle root node specially
+	if strings.Count(path, "/") <= 1 && path != "" {
+		name = path
+	}
+
+	box := obj.(*fyne.Container)
+	icon := box.Objects[0].(*widget.Icon)
+	label := box.Objects[1].(*widget.Label)
+
+	label.SetText(name)
+	if branch {
+		icon.SetResource(theme.FolderIcon())
+	} else {
+		icon.SetResource(theme.FileIcon())
+	}
+}
+
+// loadFileContent loads and displays file content
 func (d *Dashboard) loadFileContent(path string) {
 	d.contentArea.SetText("Loading...")
 
@@ -141,6 +199,7 @@ func (d *Dashboard) loadFileContent(path string) {
 	go func() {
 		content, err := d.sshClient.ReadFile(path)
 		if err != nil {
+			log.Printf("Failed to read file %s: %v", path, err)
 			d.contentArea.SetText(fmt.Sprintf("Error reading file: %v", err))
 			return
 		}

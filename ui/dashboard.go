@@ -6,6 +6,7 @@ import (
 	"logsearch/ssh"
 	"path/filepath"
 	"sort"
+	"strings"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
@@ -22,14 +23,16 @@ type Dashboard struct {
 	rootPath    string
 	window      fyne.Window
 
-	fileList       *widget.List
-	fileEntries    []ssh.FileEntry
-	selected       map[int]bool // Track selected indices
+	fileTree       *widget.Tree
+	selected       map[string]bool // Track selected paths
 	contentArea    *widget.Entry
 	contentBinding binding.String
 	pathLabel      *widget.Label
 
 	searchEntry *widget.Entry
+
+	// Cache for directory contents
+	dirCache map[string][]ssh.FileEntry
 }
 
 func NewDashboard(window fyne.Window, client *ssh.Client, initialPath string) *Dashboard {
@@ -38,61 +41,55 @@ func NewDashboard(window fyne.Window, client *ssh.Client, initialPath string) *D
 		currentPath:    initialPath,
 		rootPath:       initialPath,
 		window:         window,
-		selected:       make(map[int]bool),
+		selected:       make(map[string]bool),
 		contentBinding: binding.NewString(),
+		dirCache:       make(map[string][]ssh.FileEntry),
 	}
 
 	d.pathLabel = widget.NewLabel(initialPath)
 	d.pathLabel.TextStyle = fyne.TextStyle{Monospace: true}
 
-	d.fileList = widget.NewList(
-		func() int {
-			return len(d.fileEntries)
+	// Create tree widget
+	d.fileTree = widget.NewTree(
+		// ChildUIDs: Return child node IDs for a given parent
+		func(uid widget.TreeNodeID) []widget.TreeNodeID {
+			return d.getChildUIDs(uid)
 		},
-		func() fyne.CanvasObject {
-			// Checkbox + Icon + Label
+		// IsBranch: Determine if a node is a directory
+		func(uid widget.TreeNodeID) bool {
+			return d.isBranch(uid)
+		},
+		// CreateNode: Create the visual template for a node
+		func(branch bool) fyne.CanvasObject {
 			return container.NewHBox(
 				widget.NewCheck("", nil),
 				widget.NewIcon(theme.FileIcon()),
 				widget.NewLabel("Template"),
 			)
 		},
-		func(id widget.ListItemID, item fyne.CanvasObject) {
-			entry := d.fileEntries[id]
-			box := item.(*fyne.Container)
-			check := box.Objects[0].(*widget.Check)
-			icon := box.Objects[1].(*widget.Icon)
-			label := box.Objects[2].(*widget.Label)
-
-			label.SetText(entry.Name)
-			if entry.IsDir {
-				icon.SetResource(theme.FolderIcon())
-			} else {
-				icon.SetResource(theme.FileIcon())
-			}
-
-			check.OnChanged = nil // Avoid triggering during update
-			check.SetChecked(d.selected[id])
-			check.OnChanged = func(checked bool) {
-				if checked {
-					d.selected[id] = true
-				} else {
-					delete(d.selected, id)
-				}
-			}
+		// UpdateNode: Update the node with actual data
+		func(uid widget.TreeNodeID, branch bool, obj fyne.CanvasObject) {
+			d.updateNode(uid, branch, obj)
 		},
 	)
 
-	d.fileList.OnSelected = func(id widget.ListItemID) {
-		entry := d.fileEntries[id]
-		fullPath := filepath.Join(d.currentPath, entry.Name)
-
-		if entry.IsDir {
-			d.refreshFileList(fullPath)
-			d.fileList.UnselectAll()
+	// Handle node selection (clicking the label/icon, not checkbox)
+	d.fileTree.OnSelected = func(uid widget.TreeNodeID) {
+		path := string(uid)
+		if d.isBranch(uid) {
+			// Directory selected - toggle expansion
+			if d.fileTree.IsBranchOpen(uid) {
+				d.fileTree.CloseBranch(uid)
+			} else {
+				d.fileTree.OpenBranch(uid)
+			}
+			// Keep selection to show current location, or unselect if preferred
+			// d.fileTree.Unselect(uid)
 		} else {
-			d.loadFileContent(fullPath)
+			// File selected - load content
+			d.loadFileContent(path)
 		}
+		d.pathLabel.SetText(path)
 	}
 
 	d.contentArea = widget.NewEntryWithData(d.contentBinding)
@@ -100,30 +97,16 @@ func NewDashboard(window fyne.Window, client *ssh.Client, initialPath string) *D
 	d.contentArea.TextStyle = fyne.TextStyle{Monospace: true}
 	d.contentArea.Wrapping = fyne.TextWrapOff
 
-	// Back button
-	backBtn := widget.NewButtonWithIcon("Up", theme.NavigateBackIcon(), nil)
-	backBtn.OnTapped = func() {
-		if d.currentPath == d.rootPath {
-			return
-		}
-		parent := filepath.Dir(d.currentPath)
-		// Ensure we don't go above rootPath (simple string check, assuming paths are clean)
-		// A better check would be checking if parent has prefix rootPath
-		if len(parent) >= len(d.rootPath) {
-			d.refreshFileList(parent)
-		}
-	}
-
 	// Search UI
 	d.searchEntry = widget.NewEntry()
 	d.searchEntry.SetPlaceHolder("Regex Pattern")
 	searchBtn := widget.NewButtonWithIcon("Search", theme.SearchIcon(), d.performSearch)
 
 	leftPane := container.NewBorder(
-		container.NewVBox(widget.NewLabel("Files"), backBtn),
+		widget.NewLabel("Files"),
 		container.NewVBox(d.searchEntry, searchBtn),
 		nil, nil,
-		d.fileList,
+		d.fileTree,
 	)
 
 	rightPane := container.NewBorder(
@@ -141,19 +124,35 @@ func NewDashboard(window fyne.Window, client *ssh.Client, initialPath string) *D
 		split,
 	)
 
-	// Initial load
-	d.refreshFileList(initialPath)
+	// Initial load - open the root path
+	d.fileTree.OpenBranch(widget.TreeNodeID(initialPath))
 
 	return d
 }
 
-func (d *Dashboard) refreshFileList(path string) {
+// getChildUIDs returns the child node IDs for a given parent
+func (d *Dashboard) getChildUIDs(uid widget.TreeNodeID) []widget.TreeNodeID {
+	var path string
+	if uid == "" {
+		// Root level - return the initial path
+		path = d.rootPath
+		return []widget.TreeNodeID{widget.TreeNodeID(path)}
+	}
+
+	path = string(uid)
+
+	// Check cache first
+	if entries, ok := d.dirCache[path]; ok {
+		log.Printf("Using cached entries for %s", path)
+		return d.entriesToUIDs(path, entries)
+	}
+
+	// Load directory contents
 	log.Printf("Listing directory: %s", path)
 	entries, err := d.sshClient.ListDir(path)
 	if err != nil {
 		log.Printf("Failed to list directory %s: %v", path, err)
-		dialog.ShowError(err, d.window)
-		return
+		return []widget.TreeNodeID{}
 	}
 	log.Printf("Found %d entries in %s", len(entries), path)
 
@@ -168,11 +167,82 @@ func (d *Dashboard) refreshFileList(path string) {
 		return entries[i].Name < entries[j].Name
 	})
 
-	d.fileEntries = entries
-	d.selected = make(map[int]bool) // Reset selection on nav
-	d.currentPath = path
-	d.pathLabel.SetText(path)
-	d.fileList.Refresh()
+	// Cache the results
+	d.dirCache[path] = entries
+
+	return d.entriesToUIDs(path, entries)
+}
+
+// entriesToUIDs converts file entries to tree node IDs
+func (d *Dashboard) entriesToUIDs(parentPath string, entries []ssh.FileEntry) []widget.TreeNodeID {
+	var uids []widget.TreeNodeID
+	for _, entry := range entries {
+		fullPath := filepath.Join(parentPath, entry.Name)
+		uids = append(uids, widget.TreeNodeID(fullPath))
+	}
+	return uids
+}
+
+// isBranch determines if a node is a directory
+func (d *Dashboard) isBranch(uid widget.TreeNodeID) bool {
+	if uid == "" {
+		return true // Root is always a branch
+	}
+
+	path := string(uid)
+
+	// Check if this path is in our cache
+	parentPath := filepath.Dir(path)
+	if entries, ok := d.dirCache[parentPath]; ok {
+		name := filepath.Base(path)
+		for _, entry := range entries {
+			if entry.Name == name {
+				return entry.IsDir
+			}
+		}
+	}
+
+	// If not in cache (e.g. root), treat as branch if it's the root path
+	if path == d.rootPath {
+		return true
+	}
+
+	// Fallback: try to list it
+	_, err := d.sshClient.ListDir(path)
+	return err == nil
+}
+
+// updateNode updates the visual representation of a node
+func (d *Dashboard) updateNode(uid widget.TreeNodeID, branch bool, obj fyne.CanvasObject) {
+	path := string(uid)
+	name := filepath.Base(path)
+
+	// Handle root node specially
+	if strings.Count(path, "/") <= 1 && path != "" {
+		name = path
+	}
+
+	box := obj.(*fyne.Container)
+	check := box.Objects[0].(*widget.Check)
+	icon := box.Objects[1].(*widget.Icon)
+	label := box.Objects[2].(*widget.Label)
+
+	label.SetText(name)
+	if branch {
+		icon.SetResource(theme.FolderIcon())
+	} else {
+		icon.SetResource(theme.FileIcon())
+	}
+
+	check.OnChanged = nil // Avoid triggering during update
+	check.SetChecked(d.selected[path])
+	check.OnChanged = func(checked bool) {
+		if checked {
+			d.selected[path] = true
+		} else {
+			delete(d.selected, path)
+		}
+	}
 }
 
 func (d *Dashboard) loadFileContent(path string) {
@@ -215,10 +285,8 @@ func (d *Dashboard) performSearch() {
 	}
 
 	var paths []string
-	for id := range d.selected {
-		if id < len(d.fileEntries) {
-			paths = append(paths, filepath.Join(d.currentPath, d.fileEntries[id].Name))
-		}
+	for path := range d.selected {
+		paths = append(paths, path)
 	}
 
 	d.contentBinding.Set("Searching...")

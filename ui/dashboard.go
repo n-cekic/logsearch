@@ -331,6 +331,7 @@ func (d *Dashboard) renderContent(text string, pattern string) {
 				Text: text[lastIndex:start],
 				Style: widget.RichTextStyle{
 					TextStyle: fyne.TextStyle{Monospace: true},
+					Inline:    true,
 				},
 			})
 		}
@@ -357,6 +358,7 @@ func (d *Dashboard) renderContent(text string, pattern string) {
 			Text: text[lastIndex:],
 			Style: widget.RichTextStyle{
 				TextStyle: fyne.TextStyle{Monospace: true},
+				Inline:    true,
 			},
 		})
 	}

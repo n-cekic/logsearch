@@ -35,7 +35,7 @@ func NewLoginScreen(onConnect func(host, port, user, pass, key, logPath string))
 	logPathEntry.Text = "/home/ncekic/src/logsearch/testing_logs"
 
 	// Custom layout to center the button
-	connectBtn := widget.NewButtonWithIcon("Connect", theme.LoginIcon(), func() {
+	connectAction := func() {
 		if onConnect != nil {
 			onConnect(
 				hostEntry.Text,
@@ -46,7 +46,17 @@ func NewLoginScreen(onConnect func(host, port, user, pass, key, logPath string))
 				logPathEntry.Text,
 			)
 		}
-	})
+	}
+
+	// Allow pressing Enter to connect
+	hostEntry.OnSubmitted = func(_ string) { connectAction() }
+	portEntry.OnSubmitted = func(_ string) { connectAction() }
+	userEntry.OnSubmitted = func(_ string) { connectAction() }
+	passEntry.OnSubmitted = func(_ string) { connectAction() }
+	keyEntry.OnSubmitted = func(_ string) { connectAction() }
+	logPathEntry.OnSubmitted = func(_ string) { connectAction() }
+
+	connectBtn := widget.NewButtonWithIcon("Connect", theme.LoginIcon(), connectAction)
 	connectBtn.Importance = widget.HighImportance
 
 	formContent := container.NewVBox(

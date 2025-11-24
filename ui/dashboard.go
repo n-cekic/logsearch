@@ -5,12 +5,12 @@ import (
 	"log"
 	"logsearch/ssh"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
-	"fyne.io/fyne/v2/data/binding"
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
@@ -23,11 +23,10 @@ type Dashboard struct {
 	rootPath    string
 	window      fyne.Window
 
-	fileTree       *widget.Tree
-	selected       map[string]bool // Track selected paths
-	contentArea    *widget.Entry
-	contentBinding binding.String
-	pathLabel      *widget.Label
+	fileTree    *widget.Tree
+	selected    map[string]bool // Track selected paths
+	contentArea *widget.RichText
+	pathLabel   *widget.Label
 
 	searchEntry *widget.Entry
 
@@ -37,13 +36,12 @@ type Dashboard struct {
 
 func NewDashboard(window fyne.Window, client *ssh.Client, initialPath string) *Dashboard {
 	d := &Dashboard{
-		sshClient:      client,
-		currentPath:    initialPath,
-		rootPath:       initialPath,
-		window:         window,
-		selected:       make(map[string]bool),
-		contentBinding: binding.NewString(),
-		dirCache:       make(map[string][]ssh.FileEntry),
+		sshClient:   client,
+		currentPath: initialPath,
+		rootPath:    initialPath,
+		window:      window,
+		selected:    make(map[string]bool),
+		dirCache:    make(map[string][]ssh.FileEntry),
 	}
 
 	d.pathLabel = widget.NewLabel(initialPath)
@@ -92,9 +90,7 @@ func NewDashboard(window fyne.Window, client *ssh.Client, initialPath string) *D
 		d.pathLabel.SetText(path)
 	}
 
-	d.contentArea = widget.NewEntryWithData(d.contentBinding)
-	d.contentArea.MultiLine = true
-	d.contentArea.TextStyle = fyne.TextStyle{Monospace: true}
+	d.contentArea = widget.NewRichTextFromMarkdown("")
 	d.contentArea.Wrapping = fyne.TextWrapOff
 
 	// Search UI
@@ -112,7 +108,7 @@ func NewDashboard(window fyne.Window, client *ssh.Client, initialPath string) *D
 	rightPane := container.NewBorder(
 		widget.NewLabel("Content / Results"),
 		nil, nil, nil,
-		d.contentArea,
+		container.NewScroll(d.contentArea),
 	)
 
 	split := container.NewHSplit(leftPane, rightPane)
@@ -143,7 +139,6 @@ func (d *Dashboard) getChildUIDs(uid widget.TreeNodeID) []widget.TreeNodeID {
 
 	// Check cache first
 	if entries, ok := d.dirCache[path]; ok {
-		log.Printf("Using cached entries for %s", path)
 		return d.entriesToUIDs(path, entries)
 	}
 
@@ -247,14 +242,14 @@ func (d *Dashboard) updateNode(uid widget.TreeNodeID, branch bool, obj fyne.Canv
 
 func (d *Dashboard) loadFileContent(path string) {
 	log.Printf("Loading file content: %s", path)
-	d.contentBinding.Set("Loading...")
+	d.renderContent("Loading...", "")
 
 	// Run in goroutine to avoid freezing UI
 	go func() {
 		content, err := d.sshClient.ReadFile(path)
 		if err != nil {
 			log.Printf("Failed to read file %s: %v", path, err)
-			d.contentBinding.Set(fmt.Sprintf("Error reading file: %v", err))
+			d.renderContent(fmt.Sprintf("Error reading file: %v", err), "")
 			return
 		}
 
@@ -268,7 +263,7 @@ func (d *Dashboard) loadFileContent(path string) {
 			text = "[Truncated... showing last 100KB]\n" + text
 		}
 
-		d.contentBinding.Set(text)
+		d.renderContent(text, "")
 	}()
 }
 
@@ -289,19 +284,83 @@ func (d *Dashboard) performSearch() {
 		paths = append(paths, path)
 	}
 
-	d.contentBinding.Set("Searching...")
+	d.renderContent("Searching...", "")
 
 	go func() {
 		results, err := d.sshClient.Search(paths, pattern)
 		if err != nil {
-			d.contentBinding.Set(fmt.Sprintf("Search error: %v", err))
+			d.renderContent(fmt.Sprintf("Search error: %v", err), "")
 			return
 		}
 
 		if results == "" {
-			d.contentBinding.Set("No matches found.")
+			d.renderContent("No matches found.", "")
 		} else {
-			d.contentBinding.Set(results)
+			d.renderContent(results, pattern)
 		}
 	}()
+}
+
+// renderContent displays text in the RichText widget, highlighting matches if a pattern is provided
+func (d *Dashboard) renderContent(text string, pattern string) {
+	d.contentArea.Segments = nil
+
+	if pattern == "" {
+		d.contentArea.ParseMarkdown("```\n" + text + "\n```")
+		d.contentArea.Refresh()
+		return
+	}
+
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		d.contentArea.ParseMarkdown("Invalid regex: " + err.Error())
+		d.contentArea.Refresh()
+		return
+	}
+
+	var segments []widget.RichTextSegment
+	lastIndex := 0
+
+	matches := re.FindAllStringIndex(text, -1)
+	for _, match := range matches {
+		start, end := match[0], match[1]
+
+		// Add non-matched text before the match
+		if start > lastIndex {
+			segments = append(segments, &widget.TextSegment{
+				Text: text[lastIndex:start],
+				Style: widget.RichTextStyle{
+					TextStyle: fyne.TextStyle{Monospace: true},
+				},
+			})
+		}
+
+		// Add matched text with highlighting
+		segments = append(segments, &widget.TextSegment{
+			Text: text[start:end],
+			Style: widget.RichTextStyle{
+				ColorName: theme.ColorNameError, // Make it red to stand out
+				TextStyle: fyne.TextStyle{
+					Monospace: true,
+					Bold:      true,
+				},
+				Inline: true, // Should add background, but color ensures visibility
+			},
+		})
+
+		lastIndex = end
+	}
+
+	// Add remaining text
+	if lastIndex < len(text) {
+		segments = append(segments, &widget.TextSegment{
+			Text: text[lastIndex:],
+			Style: widget.RichTextStyle{
+				TextStyle: fyne.TextStyle{Monospace: true},
+			},
+		})
+	}
+
+	d.contentArea.Segments = segments
+	d.contentArea.Refresh()
 }

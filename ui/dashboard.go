@@ -2,12 +2,14 @@ package ui
 
 import (
 	"fmt"
+	"log"
 	"logsearch/ssh"
 	"path/filepath"
 	"sort"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/data/binding"
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
@@ -17,23 +19,27 @@ type Dashboard struct {
 	Container   *fyne.Container
 	sshClient   *ssh.Client
 	currentPath string
+	rootPath    string
 	window      fyne.Window
 
-	fileList    *widget.List
-	fileEntries []ssh.FileEntry
-	selected    map[int]bool // Track selected indices
-	contentArea *widget.Entry
-	pathLabel   *widget.Label
+	fileList       *widget.List
+	fileEntries    []ssh.FileEntry
+	selected       map[int]bool // Track selected indices
+	contentArea    *widget.Entry
+	contentBinding binding.String
+	pathLabel      *widget.Label
 
 	searchEntry *widget.Entry
 }
 
 func NewDashboard(window fyne.Window, client *ssh.Client, initialPath string) *Dashboard {
 	d := &Dashboard{
-		sshClient:   client,
-		currentPath: initialPath,
-		window:      window,
-		selected:    make(map[int]bool),
+		sshClient:      client,
+		currentPath:    initialPath,
+		rootPath:       initialPath,
+		window:         window,
+		selected:       make(map[int]bool),
+		contentBinding: binding.NewString(),
 	}
 
 	d.pathLabel = widget.NewLabel(initialPath)
@@ -89,19 +95,24 @@ func NewDashboard(window fyne.Window, client *ssh.Client, initialPath string) *D
 		}
 	}
 
-	d.contentArea = widget.NewMultiLineEntry()
+	d.contentArea = widget.NewEntryWithData(d.contentBinding)
+	d.contentArea.MultiLine = true
 	d.contentArea.TextStyle = fyne.TextStyle{Monospace: true}
 	d.contentArea.Wrapping = fyne.TextWrapOff
 
 	// Back button
-	backBtn := widget.NewButtonWithIcon("Up", theme.NavigateBackIcon(), func() {
-		parent := filepath.Dir(d.currentPath)
-		if parent != "." && parent != "/" {
-			d.refreshFileList(parent)
-		} else if parent == "/" {
-			d.refreshFileList("/")
+	backBtn := widget.NewButtonWithIcon("Up", theme.NavigateBackIcon(), nil)
+	backBtn.OnTapped = func() {
+		if d.currentPath == d.rootPath {
+			return
 		}
-	})
+		parent := filepath.Dir(d.currentPath)
+		// Ensure we don't go above rootPath (simple string check, assuming paths are clean)
+		// A better check would be checking if parent has prefix rootPath
+		if len(parent) >= len(d.rootPath) {
+			d.refreshFileList(parent)
+		}
+	}
 
 	// Search UI
 	d.searchEntry = widget.NewEntry()
@@ -137,11 +148,14 @@ func NewDashboard(window fyne.Window, client *ssh.Client, initialPath string) *D
 }
 
 func (d *Dashboard) refreshFileList(path string) {
+	log.Printf("Listing directory: %s", path)
 	entries, err := d.sshClient.ListDir(path)
 	if err != nil {
+		log.Printf("Failed to list directory %s: %v", path, err)
 		dialog.ShowError(err, d.window)
 		return
 	}
+	log.Printf("Found %d entries in %s", len(entries), path)
 
 	// Sort: Directories first, then files
 	sort.Slice(entries, func(i, j int) bool {
@@ -162,24 +176,29 @@ func (d *Dashboard) refreshFileList(path string) {
 }
 
 func (d *Dashboard) loadFileContent(path string) {
-	d.contentArea.SetText("Loading...")
+	log.Printf("Loading file content: %s", path)
+	d.contentBinding.Set("Loading...")
 
 	// Run in goroutine to avoid freezing UI
 	go func() {
 		content, err := d.sshClient.ReadFile(path)
 		if err != nil {
-			d.contentArea.SetText(fmt.Sprintf("Error reading file: %v", err))
+			log.Printf("Failed to read file %s: %v", path, err)
+			d.contentBinding.Set(fmt.Sprintf("Error reading file: %v", err))
 			return
 		}
+
+		log.Printf("Read %d bytes from %s", len(content), path)
 
 		// Limit content size for performance
 		text := string(content)
 		if len(text) > 100000 {
+			log.Printf("Truncating file content for display (original size: %d)", len(text))
 			text = text[len(text)-100000:] // Show last 100KB
 			text = "[Truncated... showing last 100KB]\n" + text
 		}
 
-		d.contentArea.SetText(text)
+		d.contentBinding.Set(text)
 	}()
 }
 
@@ -202,19 +221,19 @@ func (d *Dashboard) performSearch() {
 		}
 	}
 
-	d.contentArea.SetText("Searching...")
+	d.contentBinding.Set("Searching...")
 
 	go func() {
 		results, err := d.sshClient.Search(paths, pattern)
 		if err != nil {
-			d.contentArea.SetText(fmt.Sprintf("Search error: %v", err))
+			d.contentBinding.Set(fmt.Sprintf("Search error: %v", err))
 			return
 		}
 
 		if results == "" {
-			d.contentArea.SetText("No matches found.")
+			d.contentBinding.Set("No matches found.")
 		} else {
-			d.contentArea.SetText(results)
+			d.contentBinding.Set(results)
 		}
 	}()
 }
